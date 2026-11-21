@@ -567,30 +567,23 @@ void app_main(void)
     };
 
     QueueHandle_t uart_queue = NULL;
-    uart_driver_install(BOARD_UART_PORT, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, UART_QUEUE_SIZE, &uart_queue, 0);
-    uart_param_config(BOARD_UART_PORT, &uart_config);
-    uart_set_pin(BOARD_UART_PORT, BOARD_UART_TXD_PIN, BOARD_UART_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    ESP_ERROR_CHECK(uart_driver_install(BOARD_UART_PORT, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, UART_QUEUE_SIZE, &uart_queue, 0));
+    ESP_ERROR_CHECK(uart_param_config(BOARD_UART_PORT, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(BOARD_UART_PORT, BOARD_UART_TXD_PIN, BOARD_UART_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_LOGI(TAG, "init UART%d: %"PRIu32 " %s %s %s", BOARD_UART_PORT, s_baud_rate_active, STR_DATA_BITS(s_data_bits_active), STR_PARITY(s_parity_active), STR_STOP_BITS(s_stop_bits_active));
 
-    board_zg23_reset_gpio_init();
+    ESP_ERROR_CHECK(board_zg23_reset_gpio_init() ? ESP_OK : ESP_FAIL);
 
     s_usb_tx_ringbuf = xRingbufferCreate(USB_TX_BUF_SIZE, RINGBUF_TYPE_BYTEBUF);
     s_trigger_bootloader = xSemaphoreCreateBinary();
 
-    if (s_usb_tx_ringbuf == NULL) {
-        ESP_LOGE(TAG, "USB TX buffer creation error");
-        assert(0);
-    }
-
     s_usb_rx_ringbuf = xRingbufferCreate(UART_TX_BUF_SIZE, RINGBUF_TYPE_BYTEBUF);
-    if (s_usb_rx_ringbuf == NULL) {
-        ESP_LOGE(TAG, "USB RX buffer creation error");
-        assert(0);
-    }
+    ESP_ERROR_CHECK(s_usb_tx_ringbuf && s_usb_rx_ringbuf && s_trigger_bootloader
+                    ? ESP_OK : ESP_ERR_NO_MEM);
 
     // Determine MAC address and use it as the serial number
     uint8_t mac[8];
-    esp_efuse_mac_get_default(mac);
+    ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
 
     // Convert MAC to hex string for serial number
     char serial_str[13];  // 6 bytes * 2 chars per byte + null terminator
@@ -664,17 +657,17 @@ void app_main(void)
         stack_size = 8192;  // Increase stack size for debug logging
     }
 
-    xTaskCreate(usb_tx_task, "usb_tx", stack_size, &acm_cfg, 4, &usb_tx_handle);
+    ESP_ERROR_CHECK(xTaskCreate(usb_tx_task, "usb_tx", stack_size, &acm_cfg, 4, &usb_tx_handle) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     s_usb_tx_handle = usb_tx_handle; // Store in global variable for access in tinyusb callbacks
-    xTaskCreate(uart_tx_task, "uart_tx", stack_size, NULL, 4, NULL);
-    xTaskCreate(bootloader_reset_task, "bootloader_reset", 2048, NULL, 4, NULL);
+    ESP_ERROR_CHECK(xTaskCreate(uart_tx_task, "uart_tx", stack_size, NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(bootloader_reset_task, "bootloader_reset", 2048, NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     uart_rx_task_param_t uart_rx_task_param = {
         .usb_tx_handle = usb_tx_handle,
         .uart_queue = uart_queue,
     };
     TaskHandle_t uart_rx_handle;
-    xTaskCreate(uart_rx_task, "uart_rx", stack_size, &uart_rx_task_param, 4, &uart_rx_handle);
+    ESP_ERROR_CHECK(xTaskCreate(uart_rx_task, "uart_rx", stack_size, &uart_rx_task_param, 4, &uart_rx_handle) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
     ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
