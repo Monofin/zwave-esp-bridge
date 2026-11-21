@@ -454,6 +454,8 @@ static void uart_rx_task(void *arg)
 
     uint8_t data[UART_RX_BUF_SIZE] = {0};
     uart_event_t event;
+    // The driver can receive data before CDC initialization has completed.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     // Running total of bytes dropped because the USB TX ring buffer was full (never
     // reset), and the back-dated timestamp of the last warning about it.
     uint32_t dropped_total = 0;
@@ -644,8 +646,6 @@ void app_main(void)
         .external_phy = false
     };
 
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
-
     tinyusb_config_cdcacm_t acm_cfg = {
         .usb_dev = TINYUSB_USBDEV_0,
         .cdc_port = TINYUSB_CDC_ACM_0,
@@ -655,8 +655,6 @@ void app_main(void)
         .callback_line_state_changed = &tinyusb_cdc_line_state_changed_callback,
         .callback_line_coding_changed = &tinyusb_cdc_line_coding_changed_callback
     };
-
-    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
 
     TaskHandle_t usb_tx_handle = NULL;
 
@@ -671,13 +669,16 @@ void app_main(void)
     xTaskCreate(uart_tx_task, "uart_tx", stack_size, NULL, 4, NULL);
     xTaskCreate(bootloader_reset_task, "bootloader_reset", 2048, NULL, 4, NULL);
 
-    vTaskDelay(pdMS_TO_TICKS(500));
-
     uart_rx_task_param_t uart_rx_task_param = {
         .usb_tx_handle = usb_tx_handle,
         .uart_queue = uart_queue,
     };
-    xTaskCreate(uart_rx_task, "uart_rx", stack_size, (void *)&uart_rx_task_param, 4, NULL);
+    TaskHandle_t uart_rx_handle;
+    xTaskCreate(uart_rx_task, "uart_rx", stack_size, &uart_rx_task_param, 4, &uart_rx_handle);
+
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
+    xTaskNotifyGive(uart_rx_handle);
 
     ESP_LOGI(TAG, "USB initialization DONE");
 
