@@ -403,6 +403,22 @@ static esp_err_t ringbuf_read_bytes(RingbufHandle_t ring_buf, uint8_t *out_buf, 
     return ESP_OK;
 }
 
+// The blocking esp_tinyusb flush logs each timeout before the caller can rate-limit it.
+static esp_err_t flush_usb_tx(tinyusb_cdcacm_itf_t itf, TickType_t timeout)
+{
+    TickType_t start = xTaskGetTickCount();
+    for (;;) {
+        esp_err_t status = tinyusb_cdcacm_write_flush(itf, 0);
+        if (status != ESP_ERR_NOT_FINISHED) {
+            return status;
+        }
+        if (xTaskGetTickCount() - start >= timeout) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1);
+    }
+}
+
 static void usb_tx_task(void *arg)
 {
     tinyusb_config_cdcacm_t *acm_cfg = (tinyusb_config_cdcacm_t *)arg;
@@ -452,7 +468,7 @@ static void usb_tx_task(void *arg)
             data_head += queued;
 
             ESP_LOGV(TAG, "usb tx: waiting 10ms for flush");
-            esp_err_t flush_ret = tinyusb_cdcacm_write_flush(itf, pdMS_TO_TICKS(10));
+            esp_err_t flush_ret = flush_usb_tx(itf, pdMS_TO_TICKS(10));
 
             if (flush_ret == ESP_OK) {
                 if (tx_data_size == 0) {
