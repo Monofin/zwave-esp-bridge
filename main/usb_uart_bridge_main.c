@@ -76,6 +76,47 @@ static RingbufHandle_t s_usb_tx_ringbuf = NULL;
 static RingbufHandle_t s_usb_rx_ringbuf = NULL;
 static SemaphoreHandle_t s_trigger_bootloader = NULL;
 static TaskHandle_t s_usb_tx_handle = NULL;
+static SemaphoreHandle_t s_tx_lock;
+static uint32_t s_tx_generation;
+static bool s_tx_closed;
+static bool s_dtr;
+
+// The USB callbacks run in task context. Never wait for USB progress under this lock.
+static void reset_usb_tx(bool closed)
+{
+    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    ++s_tx_generation;
+    s_tx_closed = closed;
+    size_t size;
+    void *item;
+    while ((item = xRingbufferReceive(s_usb_tx_ringbuf, &size, 0)) != NULL) {
+        vRingbufferReturnItem(s_usb_tx_ringbuf, item);
+    }
+    tud_cdc_n_write_clear(0);
+    xSemaphoreGive(s_tx_lock);
+}
+
+static void resume_usb_tx(void)
+{
+    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    s_tx_closed = false;
+    xSemaphoreGive(s_tx_lock);
+}
+
+static BaseType_t enqueue_usb_tx(const void *data, size_t length)
+{
+    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    // Data received between serial sessions has no reader.
+    BaseType_t result = pdTRUE;
+    if (!s_tx_closed) {
+        result = xRingbufferSend(s_usb_tx_ringbuf, data, length, 0);
+        if (result == pdTRUE) {
+            xTaskNotifyGive(s_usb_tx_handle);
+        }
+    }
+    xSemaphoreGive(s_tx_lock);
+    return result;
+}
 
 static bool board_zg23_reset_gpio_init(void)
 {
@@ -132,12 +173,16 @@ static bool board_zg23_reset_gpio_init(void)
 // Invoked when device is mounted
 void tud_mount_cb(void)
 {
+    s_dtr = false;
+    reset_usb_tx(false);
     ESP_LOGI(TAG, "USB Mounted");
 }
 
 // Invoked when device is unmounted
 void tud_umount_cb(void)
 {
+    s_dtr = false;
+    reset_usb_tx(true);
     ESP_LOGI(TAG, "USB Unmounted");
 }
 
@@ -172,6 +217,8 @@ static void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
     ESP_LOG_BUFFER_HEXDUMP(TAG, rx_buf, rx_size, ESP_LOG_VERBOSE);
 
     if (ret == ESP_OK && rx_size > 0) {
+        // A host that does not drive DTR can start a session by sending data.
+        resume_usb_tx();
         if (s_cmd_mode_enabled) {
             switch (rx_buf[0]) {
                 case 'I':
@@ -180,8 +227,7 @@ static void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
                     const esp_app_desc_t *app_desc = esp_app_get_description();
                     char info_buf[64]; // 31 static + 32 max version length + 1 byte null terminator
                     int len = snprintf(info_buf, sizeof(info_buf), "USB2UART bridge\r\nversion %s\r\n", app_desc->version);
-                    xRingbufferSend(s_usb_tx_ringbuf, info_buf, len, 0);
-                    xTaskNotifyGive(s_usb_tx_handle);
+                    enqueue_usb_tx(info_buf, len);
                     // Do not exit command mode
                     return;
                 case 'B':
@@ -246,6 +292,12 @@ static void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *eve
 {
     int dtr = event->line_state_changed_data.dtr;
     int rts = event->line_state_changed_data.rts;
+    if (s_dtr && !dtr) {
+        reset_usb_tx(true);
+    } else if (dtr) {
+        resume_usb_tx();
+    }
+    s_dtr = dtr;
     ESP_LOGD(TAG, "Line state changed! dtr:%d, rts:%d ", dtr, rts);
 }
 
@@ -281,9 +333,9 @@ static void tinyusb_cdc_line_coding_changed_callback(int itf, cdcacm_event_t *ev
             s_cmd_mode_enabled = true;
 
             // Send 'cmd> ' prompt to host, so it can detect that command mode is active
+            resume_usb_tx();
             const char *cmd_prompt = "cmd> ";
-            xRingbufferSend(s_usb_tx_ringbuf, cmd_prompt, strlen(cmd_prompt), 0);
-            xTaskNotifyGive(s_usb_tx_handle);
+            enqueue_usb_tx(cmd_prompt, strlen(cmd_prompt));
 
             return;
         }
@@ -366,10 +418,13 @@ static void usb_tx_task(void *arg)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         // When we do wake up, we can be sure there is data in the ring buffer
+        xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+        uint32_t generation = s_tx_generation;
         esp_err_t ret = ringbuf_read_bytes(s_usb_tx_ringbuf, data, USB_TX_BUF_SIZE, &tx_data_size, 0);
+        xSemaphoreGive(s_tx_lock);
 
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "usb tx ringbuf read failed");
+            // Closing the port can discard a batch after the task was notified.
             continue;
         } else if (tx_data_size == 0) {
             ESP_LOGE(TAG, "usb tx ringbuf read succeeded with empty read, skipping");
@@ -383,8 +438,14 @@ static void usb_tx_task(void *arg)
         // usually will take multiple iterations
         uint8_t *data_head = &data[0];
 
-        while (tx_data_size > 0) {
-            size_t queued = tinyusb_cdcacm_write_queue(itf, data_head, tx_data_size);
+        for (;;) {
+            xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+            if (generation != s_tx_generation) {
+                xSemaphoreGive(s_tx_lock);
+                break;
+            }
+            size_t queued = tx_data_size ? tinyusb_cdcacm_write_queue(itf, data_head, tx_data_size) : 0;
+            xSemaphoreGive(s_tx_lock);
             ESP_LOGV(TAG, "usb tx enqueued: size=%d, queued=%u", tx_data_size, queued);
 
             tx_data_size -= queued;
@@ -394,6 +455,9 @@ static void usb_tx_task(void *arg)
             esp_err_t flush_ret = tinyusb_cdcacm_write_flush(itf, pdMS_TO_TICKS(10));
 
             if (flush_ret == ESP_OK) {
+                if (tx_data_size == 0) {
+                    break;
+                }
                 continue;
             }
 
@@ -402,20 +466,7 @@ static void usb_tx_task(void *arg)
             // so derive the occupancy from the FIFO depth TinyUSB is configured with.)
             size_t pending = tx_data_size + (CFG_TUD_CDC_TX_BUFSIZE - tud_cdc_n_write_available(itf));
 
-            // A flush timeout only means TinyUSB's transmit FIFO did not fully drain
-            // within the wait window (espressif/esp-idf#10003); the queued bytes are
-            // untouched and TinyUSB keeps sending them from its transfer-complete
-            // callback once the host polls again. Clearing the FIFO here would discard
-            // the tail of a frame whose head is already on the wire, corrupting the
-            // stream mid-frame (#29). Hold the data and retry instead; sustained
-            // backpressure then propagates to the ring buffer, which drops whole reads
-            // with a warning instead of splitting a frame.
-            //
-            // Gate the retry on DTR (tud_cdc_n_connected()) rather than tud_ready(): an
-            // enumerated-but-idle host (no application holding the port open) never
-            // polls the IN endpoint, so retrying on tud_ready() alone would wedge this
-            // task for as long as the board sits plugged into an idle PC. DTR means an
-            // application has the port open and is expected to eventually read.
+            // Keep ownership until the final queued bytes have drained or the session ends.
             if (flush_ret == ESP_ERR_TIMEOUT && tud_cdc_n_connected(itf)) {
                 int64_t now = esp_timer_get_time();
                 if (now - stall_log_time >= STALL_LOG_INTERVAL_MICROS) {
@@ -426,30 +477,28 @@ static void usb_tx_task(void *arg)
             }
 
             if (flush_ret == ESP_ERR_TIMEOUT) {
-                // No application has the port open (DTR deasserted) or the device is
-                // detached, so the data cannot be delivered. TinyUSB does not clear its
-                // transmit FIFO on bus reset; drop the data here so a stale partial
-                // frame is not replayed when the port is (re)opened.
                 ESP_LOGW(TAG, "usb tx: not connected, dropping %u bytes", (unsigned) pending);
             } else {
                 ESP_LOGE(TAG, "usb tx: flush failed (%s), dropping %u bytes",
                          esp_err_to_name(flush_ret), (unsigned) pending);
             }
-            tud_cdc_n_write_clear(itf);
+            xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+            if (generation == s_tx_generation) {
+                tud_cdc_n_write_clear(itf);
+            }
+            xSemaphoreGive(s_tx_lock);
             break;
         }
     }
 }
 
 typedef struct uart_rx_task_param_t {
-    TaskHandle_t usb_tx_handle;
     QueueHandle_t uart_queue;
 } uart_rx_task_param_t;
 
 
 static void uart_rx_task(void *arg)
 {
-    TaskHandle_t usb_tx_handle = ((uart_rx_task_param_t*)arg)->usb_tx_handle;
     QueueHandle_t uart_queue = ((uart_rx_task_param_t*)arg)->uart_queue;
 
     uint8_t data[UART_RX_BUF_SIZE] = {0};
@@ -482,10 +531,8 @@ static void uart_rx_task(void *arg)
                         break;
                     }
 
-                    int res = xRingbufferSend(s_usb_tx_ringbuf, data, rx_data_size, 0);
-                    if (res == pdTRUE) {
-                        xTaskNotifyGive(usb_tx_handle);
-                    } else {
+                    int res = enqueue_usb_tx(data, rx_data_size);
+                    if (res != pdTRUE) {
                         // While the host stalls, the USB TX task holds pending data and
                         // the ring buffer stays full (that is the intended
                         // backpressure), so this runs for every read; throttle the
@@ -576,9 +623,10 @@ void app_main(void)
 
     s_usb_tx_ringbuf = xRingbufferCreate(USB_TX_BUF_SIZE, RINGBUF_TYPE_BYTEBUF);
     s_trigger_bootloader = xSemaphoreCreateBinary();
+    s_tx_lock = xSemaphoreCreateMutex();
 
     s_usb_rx_ringbuf = xRingbufferCreate(UART_TX_BUF_SIZE, RINGBUF_TYPE_BYTEBUF);
-    ESP_ERROR_CHECK(s_usb_tx_ringbuf && s_usb_rx_ringbuf && s_trigger_bootloader
+    ESP_ERROR_CHECK(s_usb_tx_ringbuf && s_usb_rx_ringbuf && s_trigger_bootloader && s_tx_lock
                     ? ESP_OK : ESP_ERR_NO_MEM);
 
     // Determine MAC address and use it as the serial number
@@ -663,7 +711,6 @@ void app_main(void)
     ESP_ERROR_CHECK(xTaskCreate(bootloader_reset_task, "bootloader_reset", 2048, NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     uart_rx_task_param_t uart_rx_task_param = {
-        .usb_tx_handle = usb_tx_handle,
         .uart_queue = uart_queue,
     };
     TaskHandle_t uart_rx_handle;
