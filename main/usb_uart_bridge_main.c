@@ -474,8 +474,6 @@ static void uart_rx_task(void *arg)
 
                     if (rx_data_size == 0) {
                         // There's no more data to read
-                        ESP_LOGD(TAG, "uart rx: waking up USB TX task");
-                        xTaskNotifyGive(usb_tx_handle);
                         break;
                     }
 
@@ -485,7 +483,9 @@ static void uart_rx_task(void *arg)
                     }
 
                     int res = xRingbufferSend(s_usb_tx_ringbuf, data, rx_data_size, 0);
-                    if (res != pdTRUE) {
+                    if (res == pdTRUE) {
+                        xTaskNotifyGive(usb_tx_handle);
+                    } else {
                         // While the host stalls, the USB TX task holds pending data and
                         // the ring buffer stays full (that is the intended
                         // backpressure), so this runs for every read; throttle the
@@ -657,7 +657,7 @@ void app_main(void)
         stack_size = 8192;  // Increase stack size for debug logging
     }
 
-    ESP_ERROR_CHECK(xTaskCreate(usb_tx_task, "usb_tx", stack_size, &acm_cfg, 4, &usb_tx_handle) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(usb_tx_task, "usb_tx", stack_size, &acm_cfg, 5, &usb_tx_handle) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     s_usb_tx_handle = usb_tx_handle; // Store in global variable for access in tinyusb callbacks
     ESP_ERROR_CHECK(xTaskCreate(uart_tx_task, "uart_tx", stack_size, NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(xTaskCreate(bootloader_reset_task, "bootloader_reset", 2048, NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
